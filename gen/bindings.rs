@@ -528,7 +528,7 @@ unsafe extern "C" {
     ) -> f32;
 }
 unsafe extern "C" {
-    #[doc = " Mesh stripifier\n Converts a previously vertex cache optimized triangle list to triangle strip, stitching strips using restart index or degenerate triangles\n Returns the number of indices in the resulting strip, with destination containing new index data\n For maximum efficiency the index buffer being converted has to be optimized for vertex cache first.\n Using restart indices can result in ~10% smaller index buffers, but on some GPUs restart indices may result in decreased performance.\n\n destination must contain enough space for the target index buffer, worst case can be computed with meshopt_stripifyBound\n restart_index should be 0xffff or 0xffffffff depending on index size, or 0 to use degenerate triangles"]
+    #[doc = " Mesh stripifier\n Converts a previously vertex cache optimized triangle list to triangle strip, stitching strips using restart index or degenerate triangles\n Returns the number of indices in the resulting strip, with destination containing new index data\n For maximum efficiency the index buffer being converted has to be optimized for vertex cache first.\n Using restart indices can result in ~5-10% smaller index buffers, but on some GPUs restart indices may result in decreased performance.\n\n destination must contain enough space for the target index buffer, worst case can be computed with meshopt_stripifyBound\n restart_index should be 0xffff or 0xffffffff depending on index size, or 0 to use degenerate triangles"]
     pub fn meshopt_stripify(
         destination: *mut ::std::os::raw::c_uint,
         indices: *const ::std::os::raw::c_uint,
@@ -699,6 +699,22 @@ unsafe extern "C" {
     ) -> usize;
 }
 unsafe extern "C" {
+    #[doc = " Localize meshlets\n Converts meshlets that use a global 32-bit vertex indirection buffer into self-contained meshlets.\n\n This function is a post-process for meshlets produced by any of the meshopt_buildMeshlets* functions.\n source_vertices contains 32-bit indices into vertices; the destination receives compacted, concatenated\n localized vertex data with shared boundary vertices duplicated between meshlets. Each destination meshlet's\n vertex_offset is the base of its vertex data in destination_vertices, and its 8-bit triangles are relative to\n that base. Only the first vertex_size bytes of each source vertex are copied, so vertex_size can be smaller\n than vertex_stride to pack a subset of vertex attributes; the localized data uses vertex_size as its stride.\n\n destination_vertices must contain enough space for index_count * vertex_size bytes in the worst case.\n destination_triangles must contain enough space for index_count bytes.\n destination may alias source_meshlets only if no meshlet is moved to a lower offset; use separate buffers otherwise.\n Returns the number of localized vertices written."]
+    pub fn meshopt_localizeMeshlets(
+        destination: *mut meshopt_Meshlet,
+        destination_vertices: *mut ::std::os::raw::c_void,
+        vertex_size: usize,
+        destination_triangles: *mut ::std::os::raw::c_uchar,
+        source_meshlets: *const meshopt_Meshlet,
+        meshlet_count: usize,
+        source_vertices: *const ::std::os::raw::c_uint,
+        source_triangles: *const ::std::os::raw::c_uchar,
+        vertices: *const ::std::os::raw::c_void,
+        vertex_count: usize,
+        vertex_stride: usize,
+    ) -> usize;
+}
+unsafe extern "C" {
     #[doc = " Meshlet optimizer\n Reorders meshlet vertices and triangles to maximize locality which can improve rasterizer throughput or ray tracing performance when using fast-build modes.\n\n meshlet_triangles and meshlet_vertices must refer to meshlet data; when buildMeshlets* is used, these need to be computed from meshlet's vertex_offset and triangle_offset\n triangle_count and vertex_count must not exceed implementation limits (vertex_count <= 256, triangle_count <= 512)"]
     pub fn meshopt_optimizeMeshlet(
         meshlet_vertices: *mut ::std::os::raw::c_uint,
@@ -741,6 +757,16 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn meshopt_computeMeshletBounds(
         meshlet_vertices: *const ::std::os::raw::c_uint,
+        meshlet_triangles: *const ::std::os::raw::c_uchar,
+        triangle_count: usize,
+        vertex_positions: *const f32,
+        vertex_count: usize,
+        vertex_positions_stride: usize,
+    ) -> meshopt_Bounds;
+}
+unsafe extern "C" {
+    #[doc = " Localized meshlet bounds generator\n Computes bounding volumes for a self-contained meshlet whose 8-bit triangles index directly into a localized\n vertex buffer. vertex_positions should point at the first localized vertex, with vertex_positions_stride matching\n the localized vertex stride (vertex_size used during construction). The result is compatible with all culling\n formulas documented for meshopt_computeMeshletBounds."]
+    pub fn meshopt_computeLocalMeshletBounds(
         meshlet_triangles: *const ::std::os::raw::c_uchar,
         triangle_count: usize,
         vertex_positions: *const f32,
@@ -935,4 +961,8 @@ unsafe extern "C" {
         >,
         deallocate: ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>,
     );
+}
+unsafe extern "C" {
+    #[doc = " Experimental: Enable allocation cache\n Allocates a fixed number of memory blocks to be used for temporary allocations in the library.\n Each thread performing temporary allocations can only use one block at a time; block count should be set according to expected concurrency.\n Once cache is setup, using meshopt_setAllocator is prohibited; cache needs to be disabled (using block_count=0) before reconfiguring allocation callbacks.\n This function is not thread safe and must not be called concurrently with any other meshopt_ function.\n\n block_count can be at most 64; when set to 0, the allocation cache is disabled."]
+    pub fn meshopt_setAllocatorCache(block_count: usize, block_size: usize);
 }

@@ -1,5 +1,11 @@
 # Changes
 
+## Unreleased
+
+* Updated meshoptimizer to the impakt73 fork (hash 39deac1981e357c5a64033971674b163a4e8a247)
+* Added localized meshlet APIs (`localize_meshlets`, `compute_local_meshlet_bounds` and `LocalizedMeshlets`)
+* Added FFI binding for `meshopt_setAllocatorCache`
+
 ## 0.7.0 (2026-10-17)
 
 * Upgraded meshoptimizer library to 1.3 (hash 9e1f07b159d3cb777f1c67ed31fc11fd117986f4)

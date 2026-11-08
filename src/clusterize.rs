@@ -82,6 +82,79 @@ impl Meshlets {
             .iter()
             .map(|meshlet| self.meshlet_from_ffi(meshlet))
     }
+
+    /// Converts the meshlets into self-contained localized meshlets.
+    ///
+    /// Each meshlet gets its own compact vertex buffer with boundary vertices shared with adjacent
+    /// meshlets duplicated, so the 8-bit triangle indices no longer require a global vertex
+    /// indirection buffer.
+    ///
+    /// * `vertex_size` controls how many bytes of each source vertex are copied; it must be greater
+    ///   than 0 and no greater than `vertices.vertex_stride`
+    pub fn localize(
+        &self,
+        vertices: &VertexDataAdapter<'_>,
+        vertex_size: usize,
+    ) -> LocalizedMeshlets {
+        localize_meshlets(self, vertices, vertex_size)
+    }
+}
+
+/// A self-contained meshlet with localized vertex data.
+#[derive(Debug, Copy, Clone)]
+pub struct LocalizedMeshlet<'data> {
+    /// Localized vertex data; each vertex occupies `vertex_size` bytes.
+    pub vertices: &'data [u8],
+    /// Meshlet-local 8-bit triangle indices, relative to `vertices`.
+    pub triangles: &'data [u8],
+    /// The stride, in bytes, between successive entries in `vertices`.
+    pub vertex_size: usize,
+}
+
+/// A set of self-contained meshlets produced by [`localize_meshlets`].
+pub struct LocalizedMeshlets {
+    pub meshlets: Vec<ffi::meshopt_Meshlet>,
+    pub vertices: Vec<u8>,
+    pub triangles: Vec<u8>,
+    pub vertex_size: usize,
+}
+
+impl LocalizedMeshlets {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.meshlets.len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.meshlets.is_empty()
+    }
+
+    fn meshlet_from_ffi(&self, meshlet: &ffi::meshopt_Meshlet) -> LocalizedMeshlet<'_> {
+        let vertex_offset = meshlet.vertex_offset as usize * self.vertex_size;
+        let vertex_count = meshlet.vertex_count as usize * self.vertex_size;
+        LocalizedMeshlet {
+            vertices: &self.vertices[vertex_offset..vertex_offset + vertex_count],
+            triangles: &self.triangles[meshlet.triangle_offset as usize
+                ..meshlet.triangle_offset as usize + meshlet.triangle_count as usize * 3],
+            vertex_size: self.vertex_size,
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, idx: usize) -> LocalizedMeshlet<'_> {
+        self.meshlet_from_ffi(&self.meshlets[idx])
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = LocalizedMeshlet<'_>> {
+        self.meshlets
+            .iter()
+            .map(|meshlet| self.meshlet_from_ffi(meshlet))
+    }
+
+    /// Computes culling bounds for the meshlet at `idx`.
+    pub fn compute_bounds(&self, idx: usize) -> Bounds {
+        compute_local_meshlet_bounds(self.get(idx))
+    }
 }
 
 /// Splits the mesh into a set of meshlets where each meshlet has a micro index buffer
@@ -248,6 +321,68 @@ pub fn build_meshlets_spatial(
     };
 
     finalize_meshlets(meshlets, meshlet_verts, meshlet_tris, count)
+}
+
+/// Converts meshlets into self-contained localized meshlets.
+///
+/// This is a post-process for meshlets produced by any of the `build_meshlets*` functions. Source
+/// vertex indices are resolved into a compact localized vertex buffer, with boundary vertices
+/// shared between meshlets duplicated. The resulting 8-bit triangle indices are relative to each
+/// meshlet's local vertex data and no longer require a global vertex indirection buffer.
+///
+/// Only the first `vertex_size` bytes of each source vertex are copied, so `vertex_size` can be
+/// smaller than `vertices.vertex_stride` to pack a subset of vertex attributes.
+///
+/// * `vertex_size` must be greater than 0 and no greater than `vertices.vertex_stride`
+pub fn localize_meshlets(
+    meshlets: &Meshlets,
+    vertices: &VertexDataAdapter<'_>,
+    vertex_size: usize,
+) -> LocalizedMeshlets {
+    assert!(vertex_size > 0 && vertex_size <= vertices.vertex_stride);
+    assert!(vertices.vertex_stride >= mem::size_of::<f32>() * 3);
+
+    let meshlet_count = meshlets.meshlets.len();
+    let index_count: usize = meshlets
+        .meshlets
+        .iter()
+        .map(|meshlet| meshlet.triangle_count as usize * 3)
+        .sum();
+
+    let mut local_meshlets: Vec<ffi::meshopt_Meshlet> =
+        vec![unsafe { mem::zeroed() }; meshlet_count];
+    let mut local_vertices = vec![0u8; index_count * vertex_size];
+    let mut local_triangles = vec![0u8; index_count];
+
+    let vertex_count = unsafe {
+        ffi::meshopt_localizeMeshlets(
+            local_meshlets.as_mut_ptr(),
+            local_vertices.as_mut_ptr().cast(),
+            vertex_size,
+            local_triangles.as_mut_ptr(),
+            meshlets.meshlets.as_ptr(),
+            meshlet_count,
+            meshlets.vertices.as_ptr(),
+            meshlets.triangles.as_ptr(),
+            vertices.reader.get_ref().as_ptr().cast(),
+            vertices.vertex_count,
+            vertices.vertex_stride,
+        )
+    };
+
+    local_vertices.truncate(vertex_count * vertex_size);
+    if let Some(last_meshlet) = local_meshlets.last() {
+        local_triangles.truncate(
+            last_meshlet.triangle_offset as usize + last_meshlet.triangle_count as usize * 3,
+        );
+    }
+
+    LocalizedMeshlets {
+        meshlets: local_meshlets,
+        vertices: local_vertices,
+        triangles: local_triangles,
+        vertex_size,
+    }
 }
 
 /// Reorders meshlet vertices and triangles to maximize locality, with higher levels resulting in
@@ -558,6 +693,26 @@ pub fn compute_meshlet_bounds(meshlet: Meshlet<'_>, vertices: &VertexDataAdapter
             vertices.pos_ptr(),
             vertices.vertex_count,
             vertices.vertex_stride,
+        )
+    }
+}
+
+/// Computes culling bounds for a localized meshlet.
+///
+/// The localized vertex data must contain a float3 position in the first 12 bytes of each vertex,
+/// and `vertex_size` must match the stride used when the meshlet was localized.
+pub fn compute_local_meshlet_bounds(meshlet: LocalizedMeshlet<'_>) -> Bounds {
+    assert!(meshlet.vertex_size >= mem::size_of::<f32>() * 3);
+    assert!(meshlet.vertex_size <= 256);
+    assert!(meshlet.vertex_size.is_multiple_of(mem::size_of::<f32>()));
+
+    unsafe {
+        ffi::meshopt_computeLocalMeshletBounds(
+            meshlet.triangles.as_ptr(),
+            meshlet.triangles.len() / 3,
+            meshlet.vertices.as_ptr().cast(),
+            meshlet.vertices.len() / meshlet.vertex_size,
+            meshlet.vertex_size,
         )
     }
 }
@@ -936,6 +1091,42 @@ mod tests {
         assert_eq!(meshlets.meshlets[0].vertex_count, 4);
         assert_eq!(meshlets.meshlets[1].triangle_count, 4);
         assert_eq!(meshlets.meshlets[1].vertex_count, 4);
+    }
+
+    #[test]
+    fn test_localize_meshlets() {
+        // Two tetrahedrons far apart (copied from vendor test)
+        let vb: &[f32] = &[
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 10.0, 0.0, 0.0, 11.0, 0.0,
+            0.0, 10.0, 1.0, 0.0, 10.0, 0.0, 1.0,
+        ];
+
+        let ib: &[u32] = &[
+            0, 1, 2, 0, 2, 3, 0, 3, 1, 1, 3, 2, 4, 5, 6, 4, 6, 7, 4, 7, 5, 5, 7, 6,
+        ];
+
+        let vertices =
+            VertexDataAdapter::new(typed_to_bytes(vb), 3 * mem::size_of::<f32>(), 0).unwrap();
+
+        let meshlets = build_meshlets(ib, &vertices, 16, 4, 0.0);
+        assert_eq!(meshlets.len(), 2);
+
+        let local = meshlets.localize(&vertices, mem::size_of::<[f32; 3]>());
+        assert_eq!(local.len(), 2);
+        assert_eq!(local.vertices.len(), 8 * mem::size_of::<[f32; 3]>());
+        assert_eq!(local.triangles.len(), 24);
+        assert_eq!(local.meshlets[0].vertex_offset, 0);
+        assert_eq!(local.meshlets[1].vertex_offset, 4);
+
+        for (meshlet, source) in local.iter().zip(meshlets.iter()) {
+            let bounds = compute_local_meshlet_bounds(meshlet);
+            let source_bounds = compute_meshlet_bounds(source, &vertices);
+
+            for axis in 0..3 {
+                assert!((bounds.center[axis] - source_bounds.center[axis]).abs() < 1e-5);
+            }
+            assert!((bounds.radius - source_bounds.radius).abs() < 1e-5);
+        }
     }
 
     #[test]
